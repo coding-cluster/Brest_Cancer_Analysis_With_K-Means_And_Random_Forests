@@ -1,0 +1,454 @@
+---
+title: "Breast Cancer: K-Means and Random Forests"
+author: "Alexis Alberto Zuniga Alonso"
+date: today
+format:
+  html:
+    theme: flatly
+    toc: true
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    fig-width: 8
+  typst:
+    toc: true
+    fig-width: 7
+execute:
+  warning: true
+  message: true
+  echo: true
+---
+
+# 1. Introduction
+
+Consider the dataset `BreastCancer.csv` which contains 699 observations of clinical cases where some tumor related to breast cancer was detected, and it is sought to identify whether the tumor is benign or malignant. Additionally, the data of 10 variables was registered:
+
+1. `Id` (char)
+2. `Cl.thickness` (ordinal)
+3. `Cell.size` (ordinal)
+4. `Cell.shape` (ordinal)
+5. `Marg.adhesion` (ordinal)
+6. `Epith.c.size` (ordinal)
+7. `Bare.nuclei` (factor)
+8. `Bl.cromatin` (factor)
+9. `Normal.nucleoli` (factor)
+10. `Mitoses` (factor)
+
+And the variable `Class` registers the type of tumor ('benign' or 'malignant').
+
+# 2. Data Wrangling
+
+## 2.1 Loading the raw data
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(janitor)
+library(knitr)
+```
+
+```{r}
+#| label: load-raw
+raw <- read_csv("../data/raw/BreastCancer - BreastCancer.csv",
+                show_col_types = FALSE)
+
+dim(raw)
+glimpse(raw)
+```
+
+## 2.2 First look: structure and column names
+
+```{r}
+#| label: inspect-names
+names(raw)
+head(raw, 5)
+```
+
+**Problems detected**
+
+- The first column has **no name** (`...1`) and is just a row counter exported from R. It carries no information.
+- Column names mix capitals and dots (`Cl.thickness`, `Epith.c.size`), which makes them awkward to use in code.
+- `Id` was read as a number, but it is an identifier, not something to do arithmetic with.
+
+```{r}
+#| label: check-index
+# Is the unnamed column really just 1..n?
+all(raw[[1]] == seq_len(nrow(raw)))
+```
+
+It is a pure row counter, so it is safe to drop. Then the names are standardised (snake_case), and `Id` becomes a character.
+
+```{r}
+#| label: fix-names
+df <- raw |>
+  select(-1) |>
+  clean_names() |>
+  rename(bl_chromatin = bl_cromatin) |>   # fix the typo in the original name
+  mutate(id = as.character(id))
+
+names(df)
+```
+
+## 2.3 Data types and value ranges
+
+```{r}
+#| label: inspect-types
+sapply(df, class)
+```
+
+```{r}
+#| label: inspect-ranges
+# Frequency of every value of every predictor (long format)
+df |>
+  select(-id, -class) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  count(variable, value) |>
+  pivot_wider(names_from = value, values_from = n, values_fill = 0) |>
+  kable()
+```
+
+```{r}
+#| label: inspect-class
+df |> count(class) |> mutate(prop = round(n / sum(n), 3))
+```
+
+**Problems detected**
+
+- All predictors are stored as numbers (`dbl`), but they are really **ordinal scores**, so they should be integers.
+- The frequency table shows an `NA` column: `bare_nuclei` has missing values (see next step).
+- The predictors are scored on a **1–10 scale**, with no values out of range.
+- `class` is text; it should be a factor with `benign` as the reference level. The classes are imbalanced (about 66% benign / 34% malignant), which is worth remembering for later.
+
+## 2.4 Missing values
+
+```{r}
+#| label: inspect-na
+# Missing values per column
+df |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  filter(n_missing > 0)
+```
+
+**Problem detected:** `bare_nuclei` has 16 missing values, and no other column has any. That is about 2.3% of the rows. Before deciding what to do with them, let's see whether they relate to the tumour class.
+
+```{r}
+#| label: inspect-na-class
+df |>
+  filter(is.na(bare_nuclei)) |>
+  count(class)
+```
+
+14 of the 16 missing cases are benign (88%, versus 66% overall). That is a bit higher than expected, but with only 16 cases it is weak evidence, and removing them barely changes the class balance. Because K-Means and Random Forests (in their standard implementations) need complete rows and only 2.3% of the data is affected, the 16 rows are removed (**listwise deletion**). This decision is documented here so it can be revisited (e.g., with imputation) if needed.
+
+```{r}
+#| label: fix-na
+df <- df |>
+  drop_na(bare_nuclei)
+
+nrow(df)
+anyNA(df)
+```
+
+## 2.5 Duplicated records
+
+```{r}
+#| label: inspect-dup-id
+# Repeated patient ids
+df |>
+  add_count(id, name = "n_id") |>
+  filter(n_id > 1) |>
+  arrange(id) |>
+  head(12)
+
+df |> summarise(rows = n(), unique_ids = n_distinct(id))
+```
+
+```{r}
+#| label: inspect-dup-rows
+# How many of the repeated ids are fully identical rows?
+df |> get_dupes() |> distinct() |> nrow()  # distinct duplicated profiles
+df |> get_dupes() |> count(dupe_count)
+```
+
+**Problem detected:** some ids appear more than once. Two different situations are mixed:
+
+1. **Exact duplicates** (every variable is identical): these are most likely data-entry duplicates and would be counted twice in the analysis.
+2. **Same id, different measurements**: the same patient can have several samples taken at different times, so these are legitimate observations and are kept.
+
+```{r}
+#| label: fix-dup
+n_before <- nrow(df)
+df <- df |> distinct()
+tibble(before = n_before, after = nrow(df), removed = n_before - nrow(df))
+```
+
+Only exact duplicates are removed. The repeated ids that remain have different measurements.
+
+## 2.6 Coding the variables
+
+`class` becomes a factor (a requirement for Random Forest classification) and the 1-10 scores become integers. The scores stay numeric, which is what K-Means needs.
+
+```{r}
+#| label: fix-types
+df <- df |>
+  mutate(
+    class = factor(class, levels = c("benign", "malignant")),
+    across(-c(id, class), as.integer)
+  )
+
+str(df)
+```
+
+## 2.7 Final check
+
+```{r}
+#| label: final-check
+# Everything the previous steps found should now be clean
+checks <- tibble(
+  check = c("No missing values",
+            "No exact duplicate rows",
+            "All scores in 1-10",
+            "Class has 2 levels"),
+  passed = c(!anyNA(df),
+             !anyDuplicated(df),
+             all(df |> select(-id, -class) |> unlist() |> between(1, 10)),
+             nlevels(df$class) == 2)
+)
+kable(checks)
+
+dim(df)
+df |> count(class)
+```
+
+```{r}
+#| label: save-clean
+dir.create("../data/clean", showWarnings = FALSE)
+write_csv(df, "../data/clean/breast_cancer_clean.csv")
+```
+
+# 3. Initial Statistical Description
+
+From here on, the cleaned data (`df`) is used: 675 observations, 9 numeric predictors scored 1-10, and the tumour `class`.
+
+## 3.1 Class distribution
+
+```{r}
+#| label: desc-class
+df |>
+  count(class) |>
+  mutate(percent = round(100 * n / sum(n), 1)) |>
+  kable()
+```
+
+About two thirds of the cases are benign, so the classes are moderately imbalanced. K-Means does not use the class, but the imbalance matters when evaluating the clusters and the Random Forest: accuracy alone can look good just by favouring the benign class, so sensitivity and specificity are reported as well.
+
+## 3.2 Summary statistics of the predictors
+
+```{r}
+#| label: desc-summary
+predictors <- df |> select(-id, -class)
+
+predictors |>
+  pivot_longer(everything(), names_to = "variable") |>
+  group_by(variable) |>
+  summarise(
+    mean   = mean(value),
+    sd     = sd(value),
+    median = median(value)
+  ) |>
+  arrange(desc(mean)) |>
+  kable(digits = 2)
+```
+
+**Observations**
+
+- All variables use the same 1-10 scale, and most have a median at or near the minimum (1 for `cell_size`, `cell_shape`, `marg_adhesion`, `bare_nuclei`, `normal_nucleoli` and `mitoses`) with a mean well above it. Most tumours score low, and a smaller group scores high.
+
+## 3.3 Predictors by tumour class
+
+```{r}
+#| label: desc-by-class
+df |>
+  group_by(class) |>
+  summarise(across(-id, mean)) |>
+  pivot_longer(-class, names_to = "variable") |>
+  pivot_wider(names_from = class, values_from = value) |>
+  mutate(difference = malignant - benign) |>
+  arrange(desc(difference)) |>
+  kable(digits = 2)
+```
+
+```{r}
+#| label: desc-boxplots
+#| fig-height: 6
+df |>
+  pivot_longer(-c(id, class), names_to = "variable", values_to = "score") |>
+  ggplot(aes(x = class, y = score, fill = class)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(~ variable) +
+  scale_fill_manual(values = c(benign = "steelblue", malignant = "firebrick")) +
+  labs(x = NULL, y = "Score", title = "Scores by tumour class") +
+  theme_minimal()
+```
+
+**Observations**
+
+- Malignant tumours score higher on **every** variable. The largest gaps are in `bare_nuclei` (about 1.4 in benign vs 7.6 in malignant), `cl_thickness`, `cell_size` and `cell_shape`.
+- `mitoses` has the smallest gap, and most of its values are 1 in both classes.
+- Since every variable separates the classes to some degree, both K-Means and the Random Forest have information to work with.
+
+## 3.4 Correlations between predictors
+
+```{r}
+#| label: desc-correlation
+#| fig-height: 6
+cor_mat <- cor(predictors)
+
+cor_mat |>
+  as_tibble(rownames = "var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "r") |>
+  ggplot(aes(var1, var2, fill = r)) +
+  geom_tile() +
+  geom_text(aes(label = round(r, 2)), size = 3) +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(x = NULL, y = NULL, fill = "r", title = "Correlation matrix") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#| label: desc-correlation-range
+# Strongest and weakest pairs
+cor_mat |>
+  as_tibble(rownames = "var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "r") |>
+  filter(var1 < var2) |>
+  arrange(desc(r)) |>
+  slice(c(1:3, (n() - 2):n())) |>
+  kable(digits = 2)
+```
+
+**Observations**
+
+- All correlations are **positive**, and most are moderate to strong (0.5-0.9).
+- The highest correlation is between `cell_size` and `cell_shape` (0.91); these two are nearly redundant.
+- `mitoses` is the least correlated with the rest (0.34-0.48).
+
+# 4. K-Means Algorithm
+
+K-Means is applied to the nine predictors (`id` and `class` are excluded) with K = 2, and the clusters are then compared with the real tumour classes. The class is never used to fit the model, so this checks whether the two groups are naturally present in the data.
+
+## 4.1 Fitting the model
+
+All variables share the same 1-10 scale, so they are used **without standardising**; scaling would only inflate the weight of low-variance variables such as `mitoses`. K-Means depends on the random initial centres, so the seed is fixed (`set.seed(123)`) and `nstart = 25` starting configurations are tried, keeping the best one.
+
+```{r}
+#| label: km-fit
+set.seed(123)
+km <- kmeans(predictors, centers = 2, nstart = 25)
+
+km$size
+round(km$centers, 2)
+round(100 * km$betweenss / km$totss, 1)  # % of variance explained by the clusters
+```
+
+The cluster numbers (1 and 2) are arbitrary. One cluster has low scores on every variable and the other has high scores, which looks like a benign / malignant split. To compare with the real classes, the cluster with the higher average centre is labelled `malignant`.
+
+```{r}
+#| label: km-label
+malignant_cluster <- which.max(rowMeans(km$centers))
+
+df_km <- df |>
+  mutate(cluster = factor(km$cluster,
+                          levels = c(setdiff(1:2, malignant_cluster), malignant_cluster),
+                          labels = c("benign", "malignant")))
+
+count(df_km, cluster)
+```
+
+## 4.2 Comparison with the original classes
+
+```{r}
+#| label: km-confusion
+conf <- table(Cluster = df_km$cluster, Class = df_km$class)
+conf
+
+round(100 * prop.table(conf, margin = 1), 1)  # % of each cluster by real class
+```
+
+```{r}
+#| label: km-metrics
+# Treating "malignant" as the positive class
+tp <- conf["malignant", "malignant"]
+tn <- conf["benign", "benign"]
+fp <- conf["malignant", "benign"]
+fn <- conf["benign", "malignant"]
+
+tibble(
+  metric = c("Accuracy", "Sensitivity (malignant found)",
+             "Specificity (benign found)", "Precision (malignant)"),
+  value  = c((tp + tn) / sum(conf), tp / (tp + fn), tn / (tn + fp), tp / (tp + fp))
+) |>
+  mutate(value = scales::percent(value, accuracy = 0.1)) |>
+  kable()
+```
+
+```{r}
+#| label: km-silhouette
+library(cluster)
+sil <- silhouette(km$cluster, dist(predictors))
+mean(sil[, "sil_width"])
+```
+
+## 4.3 Visualisation
+
+The clusters are drawn on two of the most discriminating variables (`cell_size` and `bare_nuclei`), next to the real classes. Points are jittered because the scores are integers.
+
+```{r}
+#| label: km-plot
+#| fig-height: 4
+bind_rows(
+  mutate(df_km, grouping = "K-Means cluster", group = cluster),
+  mutate(df_km, grouping = "Real class",      group = class)
+) |>
+  ggplot(aes(cell_size, bare_nuclei, colour = group)) +
+  geom_jitter(alpha = 0.5, width = 0.25, height = 0.25) +
+  facet_wrap(~ grouping) +
+  scale_colour_manual(values = c(benign = "steelblue", malignant = "firebrick")) +
+  labs(colour = NULL) +
+  theme_minimal()
+```
+
+Many cases share exactly the same pair of scores (for example, about 400 tumours score 1 on both variables), so the jittered points overlap. Drawing the **number of cases** at each combination of scores makes the volume visible:
+
+```{r}
+#| label: km-plot-counts
+#| fig-height: 4.5
+bind_rows(
+  mutate(df_km, grouping = "K-Means cluster", group = cluster),
+  mutate(df_km, grouping = "Real class",      group = class)
+) |>
+  count(grouping, group, cell_size, bare_nuclei) |>
+  ggplot(aes(cell_size, bare_nuclei, size = n, colour = group)) +
+  geom_point(alpha = 0.6) +
+  facet_grid(group ~ grouping) +
+  scale_size_area(max_size = 12, breaks = c(1, 10, 50, 150)) +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(breaks = 1:10) +
+  scale_colour_manual(values = c(benign = "steelblue", malignant = "firebrick"),
+                      guide = "none") +
+  labs(size = "Cases") +
+  theme_minimal()
+```
+
+Each row shows one group (benign or malignant) and each column shows how that group was defined (by K-Means or by the real class), so the two columns can be compared cell by cell.
+
+**Observations**
+
+- K-Means finds two groups of 448 and 227 cases, which are close to the real class sizes (439 benign and 236 malignant). The clusters explain about 60% of the total variance.
+- Overall, 96% of the cases are placed in the group that matches their real class (accuracy 96.0%): 430 benign and 218 malignant tumours are correctly grouped.
+- The 27 mismatches are not symmetric: 18 malignant tumours fall in the benign cluster and 9 benign ones in the malignant cluster. The sensitivity (92.4%) is therefore lower than the specificity (97.9%).
+- The average silhouette (about 0.6) indicates a reasonably well-separated structure: the groups are distinct, with some overlap in the middle.
+
