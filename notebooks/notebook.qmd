@@ -452,3 +452,128 @@ Each row shows one group (benign or malignant) and each column shows how that gr
 - The 27 mismatches are not symmetric: 18 malignant tumours fall in the benign cluster and 9 benign ones in the malignant cluster. The sensitivity (92.4%) is therefore lower than the specificity (97.9%).
 - The average silhouette (about 0.6) indicates a reasonably well-separated structure: the groups are distinct, with some overlap in the middle.
 
+# 5. Random Forest
+
+A Random Forest is trained to predict `class` from the nine predictors, using 70% of the data for training and 30% for testing.
+
+## 5.1 Train / test split
+
+Some patients have more than one sample (section 2.5). If the same patient appeared in both sets, the test would partly measure memory instead of generalisation. The split is therefore done **by patient id**: all samples of a patient go to the same set.
+
+```{r}
+#| label: rf-split
+library(rsample)
+
+set.seed(123)
+split <- group_initial_split(df, group = id, prop = 0.7)
+train <- training(split)
+test  <- testing(split)
+
+tibble(set = c("train", "test"), rows = c(nrow(train), nrow(test))) |>
+  mutate(percent = round(100 * rows / sum(rows), 1))
+
+length(intersect(train$id, test$id))  # patients shared by both sets
+```
+
+```{r}
+#| label: rf-split-class
+bind_rows(train = train, test = test, .id = "set") |>
+  count(set, class) |>
+  group_by(set) |>
+  mutate(percent = round(100 * n / sum(n), 1)) |>
+  kable()
+```
+
+The split is 70 / 30, no patient is in both sets, and both sets keep a class balance close to the full data (about 65% benign).
+
+## 5.2 Fitting the model
+
+The default settings are used: 500 trees and 3 variables tried at each split (the square root of 9). `id` is excluded from the predictors.
+
+```{r}
+#| label: rf-fit
+library(randomForest)
+
+set.seed(123)
+rf <- randomForest(class ~ . - id, data = train, ntree = 500, importance = TRUE)
+rf
+```
+
+The out-of-bag (OOB) error, estimated only from the training data, is about 3%.
+
+## 5.3 Variable importance
+
+```{r}
+#| label: rf-importance
+#| fig-height: 4
+importance(rf) |>
+  as_tibble(rownames = "variable") |>
+  ggplot(aes(MeanDecreaseAccuracy, reorder(variable, MeanDecreaseAccuracy))) +
+  geom_col(fill = "steelblue") +
+  labs(x = "Mean decrease in accuracy", y = NULL, title = "Variable importance") +
+  theme_minimal()
+```
+
+`bare_nuclei` is the most important variable, followed by `cell_size`, `cl_thickness` and `cell_shape`. `mitoses` is the least important.
+
+# 6. Performance Metrics
+
+The model predicts the test set, which it has never seen.
+
+```{r}
+#| label: rf-confusion
+pred <- predict(rf, test)
+
+rf_conf <- table(Predicted = pred, Class = test$class)
+rf_conf
+
+mean(pred == test$class)  # accuracy
+```
+
+Each metric depends on which class is taken as positive, so they are computed for **both classes**:
+
+```{r}
+#| label: rf-metrics
+class_metrics <- function(conf, positive) {
+  tp <- conf[positive, positive]
+  fn <- sum(conf[, positive]) - tp
+  fp <- sum(conf[positive, ]) - tp
+  tn <- sum(conf) - tp - fn - fp
+  sensitivity <- tp / (tp + fn)
+  precision   <- tp / (tp + fp)
+  tibble(
+    class       = positive,
+    sensitivity = sensitivity,
+    specificity = tn / (tn + fp),
+    precision   = precision,
+    f1          = 2 * precision * sensitivity / (precision + sensitivity)
+  )
+}
+
+map(levels(test$class), \(k) class_metrics(rf_conf, k)) |>
+  list_rbind() |>
+  mutate(across(-class, \(x) scales::percent(x, accuracy = 0.1))) |>
+  kable()
+```
+
+**Observations**
+
+- The accuracy on the test set is 96.6%: 196 of 203 cases are correct (136 benign and 60 malignant).
+- Only 7 cases are wrong: 5 malignant tumours are predicted as benign and 2 benign ones as malignant.
+- The sensitivity of one class equals the specificity of the other, because both come from the same two kinds of error.
+
+# 7. Discussion
+
+## 7.1 Best and worst performance
+
+- **Best:** the model finds almost every benign tumour (sensitivity 98.6%) and, equally, rarely labels a benign tumour as malignant (malignant specificity 98.6%). The benign class also has the highest F1 (97.5%).
+- **Worst:** the sensitivity for malignant tumours (92.3%) is the lowest metric. 5 of the 65 malignant tumours in the test set are missed, which also gives the malignant class the lower F1 (94.5%).
+- Precision is high and almost equal for both classes (96.5% and 96.8%): when the model says "malignant", it is right about 97% of the time.
+
+## 7.2 Interpretation
+
+- **The weak spot is the one that matters most.** In a diagnostic setting, a missed malignant tumour (false negative) is far more costly than a false alarm, which is usually caught by a follow-up test. The model makes this costly error more often than the opposite one. Part of the reason is the class imbalance: there are fewer malignant cases to learn from.
+- **The important variables match the initial description.** `bare_nuclei`, `cell_size`, `cell_shape` and `cl_thickness` had the largest gaps between classes in section 3.3, and they are also the most useful for the forest. `mitoses`, which was mostly 1 in both classes, adds little.
+- **Random Forest vs K-Means.** The forest (accuracy 96.6%) is only slightly better than K-Means (96.0%), and both miss malignant tumours more often than benign ones (malignant sensitivity about 92% in both). With 65 malignant cases in the test set, each case is worth about 1.5 points, so the difference between the two models is small. The data has a clear two-group structure that even an unsupervised method finds, so the main gain of the supervised model is that it can be evaluated on new cases and tuned, not a large jump in accuracy.
+- **Possible improvement.** If missing a malignant tumour is the main concern, the decision threshold can be lowered (classify as malignant with less than 50% of the tree votes). This raises malignant sensitivity at the cost of more false alarms.
+
